@@ -14,6 +14,22 @@ def parse_json(text):
             text = match.group(1)
     return json.loads(text)
 
+def fix_name(raw_name):
+    name = str(raw_name or "").strip()
+    if "," in name:
+        parts = [part.strip() for part in name.split(",", 1)]
+        if len(parts) == 2 and parts[1]:
+            return f"{parts[1]} {parts[0]}"
+    return name
+
+def get_position_group(pos):
+    p = str(pos or "").strip().upper()
+    if p in ("D", "LD", "RD"):
+        return "D"
+    if p in ("C", "LW", "RW", "F"):
+        return "F"
+    return "Other"
+
 def calc_decimal_age(bday_str):
     if not bday_str:
         return None
@@ -83,14 +99,12 @@ def run_prospect_engine():
         p_resp.raise_for_status()
         players = parse_json(p_resp.text).get("SiteKit", {}).get("Statviewtype", [])
 
-        if players and isinstance(players[0], dict):
-            print(f"{league_name}: fetched {len(players)} skaters (sample keys: {list(players[0].keys())[:10]})")
-
         for p in players:
             if not isinstance(p, dict):
                 continue
 
-            name = p.get("name") or f"{p.get('first_name', '')} {p.get('last_name', '')}".strip()
+            raw_name = p.get("name") or f"{p.get('first_name', '')} {p.get('last_name', '')}".strip()
+            name = fix_name(raw_name)
             try:
                 gp = int(p.get("games_played", 0) or 0)
                 goals = int(p.get("goals", 0) or 0)
@@ -102,6 +116,8 @@ def run_prospect_engine():
             if not name or gp <= 0:
                 continue
 
+            pos = str(p.get("position") or "").strip().upper()
+            team = str(p.get("team_code") or p.get("team_name") or "").strip().upper()
             age = calc_decimal_age(p.get("birthdate") or p.get("bday"))
             age_factor = get_age_factor(age)
             ppg = round(tp / gp, 2)
@@ -109,8 +125,9 @@ def run_prospect_engine():
 
             rows.append({
                 "Player": name,
-                "Team": p.get("team_code") or p.get("team_name") or "",
-                "Position": p.get("position") or "",
+                "Team": team,
+                "Position": pos,
+                "Position_Group": get_position_group(pos),
                 "League": league_name,
                 "Age": age if age is not None else "",
                 "GP": gp,

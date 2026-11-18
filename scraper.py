@@ -1,55 +1,134 @@
+import json
+import re
+from datetime import date, datetime
 import pandas as pd
 import requests
-from io import StringIO
+
+def parse_json(text):
+    text = text.strip()
+    if text.startswith("(") and text.endswith(")"):
+        text = text[1:-1]
+    elif not text.startswith("{") and not text.startswith("["):
+        match = re.search(r"(\{.*\}|\[.*\])", text, re.DOTALL)
+        if match:
+            text = match.group(1)
+    return json.loads(text)
+
+def calc_decimal_age(bday_str):
+    if not bday_str:
+        return None
+    for fmt in ("%Y-%m-%d", "%b %d, %Y", "%B %d, %Y", "%Y/%m/%d"):
+        try:
+            bday = datetime.strptime(str(bday_str).strip(), fmt).date()
+            return round((date.today() - bday).days / 365.25, 2)
+        except ValueError:
+            continue
+    return None
+
+def get_age_factor(age):
+    if age is None:
+        return 1.15
+    if age < 18.0:
+        return 1.35
+    elif age < 19.0:
+        return 1.25
+    elif age < 20.0:
+        return 1.10
+    return 1.00
 
 def run_prospect_engine():
-    # Using Elite Prospects direct stats page with full browser headers to bypass 403 blocks
-    url = 'https://www.eliteprospects.com/league/ohl/stats/2026-2027'
-    
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5'
+    # Official public HockeyTech/CHL read-only keys: [client_code, api_key, NHLe]
+    leagues = {
+        "OHL":   ("ohl",   "2976319eb44abe94", 0.30),
+        "WHL":   ("whl",   "41b145a848f4bd67", 0.29),
+        "QMJHL": ("lhjmq", "f322673b6bcae299", 0.26),
     }
 
-    print("Fetching live OHL prospect data...")
-    try:
-        response = requests.get(url, headers=headers, timeout=20)
-        response.raise_for_status()
-        
-        tables = pd.read_html(StringIO(response.text))
-        df = max(tables, key=len).copy()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+    rows = []
 
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [col[-1] for col in df.columns]
+    for league_name, (client_code, api_key, nhle) in leagues.items():
+        # 1. Auto-detect current 2026-27 regular season ID
+        seasons_url = (
+            f"https://lscluster.hockeytech.com/feed/index.php"
+            f"?feed=modulekit&view=seasons&fmt=json&key={api_key}&client_code={client_code}"
+        )
+        s_resp = requests.get(seasons_url, headers=headers, timeout=20)
+        s_resp.raise_for_status()
+        seasons = parse_json(s_resp.text).get("SiteKit", {}).get("Seasons", [])
 
-        df = df.rename(columns={'Name': 'Player', 'P': 'TP'})
-        df = df.dropna(subset=['Player', 'GP', 'TP'])
-        df['GP'] = pd.to_numeric(df['GP'], errors='coerce')
-        df['TP'] = pd.to_numeric(df['TP'], errors='coerce')
-        df = df[df['GP'] > 0].copy()
+        season_id = None
+        for s in seasons:
+            name = str(s.get("season_name", "")).lower()
+            if ("2026-27" in name or "2026-2027" in name) and "pre" not in name and "playoff" not in name:
+                season_id = s.get("season_id")
+                break
+        if not season_id:
+            for s in seasons:
+                if str(s.get("career", "")) == "1":
+                    season_id = s.get("season_id")
+                    break
 
-        df['League'] = 'OHL'
-        df['PPG'] = (df['TP'] / df['GP']).round(2)
-        df['NHLe_Multiplier'] = 0.30
-        df['Age_Factor'] = 1.25
-        df['Projected_NHL_PPG'] = (df['PPG'] * 0.30 * 1.25).round(2)
+        print(f"{league_name}: using season_id={season_id}")
 
-        final_df = df[['Player', 'League', 'GP', 'TP', 'PPG', 'NHLe_Multiplier', 'Age_Factor', 'Projected_NHL_PPG']]
-    
-    except Exception as e:
-        print(f"Scraping encountered block or error ({e}), deploying verified fallback dataset...")
-        # Fallback robust data so your CSV generation and Tableau pipeline NEVER break
-        fallback_data = [
-            ["Michael Misa", "OHL", 28, 45, 1.61, 0.30, 1.25, 0.60],
-            ["Porter Martone", "OHL", 26, 42, 1.62, 0.30, 1.25, 0.61],
-            ["Malcolm Spence", "OHL", 28, 38, 1.36, 0.30, 1.25, 0.51],
-            ["Brady Martin", "OHL", 27, 35, 1.30, 0.30, 1.25, 0.49]
-        ]
-        final_df = pd.DataFrame(fallback_data, columns=['Player', 'League', 'GP', 'TP', 'PPG', 'NHLe_Multiplier', 'Age_Factor', 'Projected_NHL_PPG'])
+        # 2. Pull top 500 live skaters from official league feed
+        stats_url = (
+            f"https://lscluster.hockeytech.com/feed/index.php"
+            f"?feed=modulekit&view=statviewtype&type=topscorers&first=0&limit=500"
+            f"&season_id={season_id}&fmt=json&key={api_key}&client_code={client_code}"
+        )
+        p_resp = requests.get(stats_url, headers=headers, timeout=25)
+        p_resp.raise_for_status()
+        players = parse_json(p_resp.text).get("SiteKit", {}).get("Statviewtype", [])
 
-    final_df.to_csv('live_prospects_feed.csv', index=False)
-    print("Success! live_prospects_feed.csv updated.")
+        if players and isinstance(players[0], dict):
+            print(f"{league_name}: fetched {len(players)} skaters (sample keys: {list(players[0].keys())[:10]})")
+
+        for p in players:
+            if not isinstance(p, dict):
+                continue
+
+            name = p.get("name") or f"{p.get('first_name', '')} {p.get('last_name', '')}".strip()
+            try:
+                gp = int(p.get("games_played", 0) or 0)
+                goals = int(p.get("goals", 0) or 0)
+                assists = int(p.get("assists", 0) or 0)
+                tp = int(p.get("points", 0) or 0)
+            except (ValueError, TypeError):
+                continue
+
+            if not name or gp <= 0:
+                continue
+
+            age = calc_decimal_age(p.get("birthdate") or p.get("bday"))
+            age_factor = get_age_factor(age)
+            ppg = round(tp / gp, 2)
+            proj_nhl_ppg = round(ppg * nhle * age_factor, 2)
+
+            rows.append({
+                "Player": name,
+                "Team": p.get("team_code") or p.get("team_name") or "",
+                "Position": p.get("position") or "",
+                "League": league_name,
+                "Age": age if age is not None else "",
+                "GP": gp,
+                "G": goals,
+                "A": assists,
+                "TP": tp,
+                "PPG": ppg,
+                "NHLe_Multiplier": nhle,
+                "Age_Factor": age_factor,
+                "Projected_NHL_PPG": proj_nhl_ppg,
+            })
+
+    if not rows:
+        raise RuntimeError("Zero real prospects returned from HockeyTech API.")
+
+    final_df = pd.DataFrame(rows).sort_values(by="Projected_NHL_PPG", ascending=False)
+    final_df.to_csv("live_prospects_feed.csv", index=False)
+    print(f"Success! Exported {len(final_df)} live CHL prospects to live_prospects_feed.csv")
 
 if __name__ == "__main__":
     run_prospect_engine()

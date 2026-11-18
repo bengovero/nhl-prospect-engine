@@ -1,0 +1,35 @@
+name: Daily Prospect Engine
+
+on:
+  schedule:
+    - cron: '0 10 * * *' # Runs daily at 10:00 UTC (4:00 AM CST)
+  workflow_dispatch:      # Adds a manual "Run Now" button
+
+permissions:
+  contents: write
+
+jobs:
+  run-scraper:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Cloud Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install scraping libraries
+        run: pip install pandas requests lxml html5lib
+
+      - name: Run NHLe Transition Engine
+        run: python scraper.py
+
+      - name: Save updated CSV to repository
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add live_prospects_feed.csv
+          git diff --staged --quiet || git commit -m "Auto-update prospect stats"
+          git push
